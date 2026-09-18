@@ -1,9 +1,10 @@
 import json
+import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import Body, FastAPI, Path, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -30,6 +31,15 @@ class ReplayIn(BaseModel):
     event_ids: list[str] = Field(..., min_length=1, max_length=1000)
 
 
+class PullIn(BaseModel):
+    limit: int = Field(100, ge=1, le=1000)
+    lease_seconds: int = Field(30, ge=1, le=86400)
+
+
+class AckIn(BaseModel):
+    lease_token: str = Field(..., min_length=1, max_length=255)
+
+
 # ---------- helpers ----------
 
 def normalize_dt(dt: datetime) -> str:
@@ -41,6 +51,10 @@ def normalize_dt(dt: datetime) -> str:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def lease_conflict(detail: str) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": detail})
 
 
 def row_to_event(row: sqlite3.Row) -> dict[str, Any]:
@@ -172,6 +186,147 @@ def replay(req: ReplayIn):
         "replayed": replayed,
         "skipped": len(results) - replayed,
         "results": results,
+    }
+
+
+# ---------- consumer cursor: pull / ack ----------
+
+@app.post("/consumers/{consumer_id}/pull")
+def pull(
+    consumer_id: str = Path(..., min_length=1, max_length=255),
+    req: PullIn = Body(default_factory=PullIn),
+):
+    """按首次接收顺序拉取尚未确认的连续事件并原子租用。
+
+    - 首次 consumer 的游标为 0, 即从 seq=1 开始投递。
+    - 存在未过期租约时, 重复拉取原样返回同一批次(不续租、不换 token)。
+    - 租约过期后同一批次可被重新投递(换发新 token)。
+    - 队列为空(没有游标之后的事件)时返回空批次, 不创建租约。
+    """
+    now = utc_now()
+    # BEGIN IMMEDIATE 与事件写入互斥, 保证"读批次 -> 建租约"原子完成
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        # 首次出现的 consumer 自动建档, 游标从 0 开始
+        conn.execute(
+            "INSERT OR IGNORE INTO consumers (consumer_id, cursor_seq) VALUES (?, 0)",
+            (consumer_id,),
+        )
+        consumer = conn.execute(
+            "SELECT cursor_seq, lease_token, lease_from_seq, lease_to_seq,"
+            " lease_expires_at FROM consumers WHERE consumer_id = ?",
+            (consumer_id,),
+        ).fetchone()
+
+        active = (
+            consumer["lease_token"] is not None
+            and datetime.fromisoformat(consumer["lease_expires_at"]) > datetime.fromisoformat(now)
+        )
+        if active:
+            # 租约未过期: 重复拉取必须返回同一批次
+            rows = conn.execute(
+                "SELECT * FROM events WHERE id BETWEEN ? AND ? ORDER BY id",
+                (consumer["lease_from_seq"], consumer["lease_to_seq"]),
+            ).fetchall()
+            return {
+                "consumer_id": consumer_id,
+                "events": [row_to_event(r) for r in rows],
+                "lease_token": consumer["lease_token"],
+                "lease_expires_at": consumer["lease_expires_at"],
+            }
+
+        if consumer["lease_token"] is not None:
+            # 上一租约已过期: 同一批次可重新投递(沿用原区间, 换发新 token)
+            rows = conn.execute(
+                "SELECT * FROM events WHERE id BETWEEN ? AND ? ORDER BY id",
+                (consumer["lease_from_seq"], consumer["lease_to_seq"]),
+            ).fetchall()
+            token = secrets.token_urlsafe(32)
+            expires_at = (
+                datetime.fromisoformat(now) + timedelta(seconds=req.lease_seconds)
+            ).isoformat()
+            conn.execute(
+                "UPDATE consumers SET lease_token = ?, lease_expires_at = ?"
+                " WHERE consumer_id = ?",
+                (token, expires_at, consumer_id),
+            )
+            return {
+                "consumer_id": consumer_id,
+                "events": [row_to_event(r) for r in rows],
+                "lease_token": token,
+                "lease_expires_at": expires_at,
+            }
+
+        # 从未租用: 从游标之后取一段连续事件
+        rows = conn.execute(
+            "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?",
+            (consumer["cursor_seq"], req.limit),
+        ).fetchall()
+        if not rows:
+            # 空队列: 返回空批次且不创建租约
+            return {
+                "consumer_id": consumer_id,
+                "events": [],
+                "lease_token": None,
+                "lease_expires_at": None,
+            }
+
+        from_seq, to_seq = rows[0]["id"], rows[-1]["id"]
+        token = secrets.token_urlsafe(32)
+        expires_at = (
+            datetime.fromisoformat(now) + timedelta(seconds=req.lease_seconds)
+        ).isoformat()
+        conn.execute(
+            "UPDATE consumers SET lease_token = ?, lease_from_seq = ?,"
+            " lease_to_seq = ?, lease_expires_at = ? WHERE consumer_id = ?",
+            (token, from_seq, to_seq, expires_at, consumer_id),
+        )
+        return {
+            "consumer_id": consumer_id,
+            "events": [row_to_event(r) for r in rows],
+            "lease_token": token,
+            "lease_expires_at": expires_at,
+        }
+
+
+@app.post("/consumers/{consumer_id}/ack")
+def ack(
+    consumer_id: str = Path(..., min_length=1, max_length=255),
+    req: AckIn = Body(...),
+):
+    """确认当前租约批次: 仅接受未过期且与当前租约一致的 token, 游标推进到批次末尾。
+
+    过期、伪造或旧 token 一律 409; 游标只随整批确认前移, 天然禁止越序确认。
+    """
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        consumer = conn.execute(
+            "SELECT cursor_seq, lease_token, lease_from_seq, lease_to_seq,"
+            " lease_expires_at FROM consumers WHERE consumer_id = ?",
+            (consumer_id,),
+        ).fetchone()
+        # 未知 consumer / 从未拉取过: 没有可确认的租约
+        if consumer is None or consumer["lease_token"] is None:
+            return lease_conflict("no active lease")
+        if consumer["lease_token"] != req.lease_token:
+            # 伪造或旧 token(旧批次过期后已被新租约取代)
+            return lease_conflict("invalid lease token")
+        if datetime.fromisoformat(consumer["lease_expires_at"]) <= now:
+            # 租约已过期, 该批次可被重新投递, 旧 token 不得再确认
+            return lease_conflict("lease expired")
+
+        to_seq = consumer["lease_to_seq"]
+        conn.execute(
+            "UPDATE consumers SET cursor_seq = ?, lease_token = NULL,"
+            " lease_from_seq = NULL, lease_to_seq = NULL, lease_expires_at = NULL"
+            " WHERE consumer_id = ?",
+            (to_seq, consumer_id),
+        )
+    return {
+        "consumer_id": consumer_id,
+        "acknowledged": True,
+        "cursor_seq": to_seq,
     }
 
 

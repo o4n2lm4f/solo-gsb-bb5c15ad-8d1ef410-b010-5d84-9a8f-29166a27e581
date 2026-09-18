@@ -18,6 +18,15 @@ CREATE TABLE IF NOT EXISTS events (
     hash        TEXT                                -- 本记录哈希(固定 JSON 规范的 SHA-256)
 );
 CREATE INDEX IF NOT EXISTS idx_events_occurred_at ON events (occurred_at);
+
+CREATE TABLE IF NOT EXISTS consumers (
+    consumer_id      TEXT PRIMARY KEY,
+    cursor_seq       INTEGER NOT NULL DEFAULT 0,  -- 已确认到的 seq; 下次从 cursor_seq+1 投递(首次为 1)
+    lease_token      TEXT,                        -- 当前租约令牌(无租约时为 NULL)
+    lease_from_seq   INTEGER,                     -- 租约批次起始 seq
+    lease_to_seq     INTEGER,                     -- 租约批次末尾 seq
+    lease_expires_at TEXT                         -- 租约过期时间(UTC ISO8601)
+);
 """
 
 
