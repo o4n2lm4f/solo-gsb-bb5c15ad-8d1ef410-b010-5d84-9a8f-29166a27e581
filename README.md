@@ -62,6 +62,7 @@ curl -X POST http://localhost:8000/replay \
 
 ### 4. 完整性校验
 
+
 ```bash
 curl http://localhost:8000/integrity
 ```
@@ -77,6 +78,43 @@ curl http://localhost:8000/integrity
 ```json
 {"verified": false, "checked": 1, "first_break": {"seq": 2, "event_id": "evt-2", "reason": "hash_mismatch"}}
 ```
+
+### 5. 消费游标(租约 + 确认)
+
+客户端按 `consumer_id` 顺序消费事件流:`pull` 原子租用游标之后一段尚未确认的连续事件并返回 `lease_token`,`ack` 凭当前租约 token 把游标推进到本批次末尾。每个 consumer 的状态(游标 + 租约)持久化在 SQLite,首次出现的 consumer 从 `seq=1` 开始。
+
+```bash
+# 拉取一批(最多 2 条, 租约 30 秒)
+curl -X POST http://localhost:8000/consumers/c1/pull \
+  -H 'Content-Type: application/json' \
+  -d '{"limit":2,"lease_seconds":30}'
+```
+
+```json
+{
+  "consumer_id": "c1",
+  "cursor": 0,
+  "lease_token": "001aedeed7806011b7376e2c8fc9f65e",
+  "lease_expires_at": "2026-09-18T19:19:11.988303+00:00",
+  "count": 2,
+  "events": [{"seq": 1, "event_id": "evt-1", "...": "..."}, {"seq": 2, "...": "..."}]
+}
+```
+
+- **租约未过期时重复 `pull` 返回同一批次**(同一 token、同一过期时间,不续租),即使传入不同的 `limit`/`lease_seconds`。
+- **租约过期后**,该批次会在下一次 `pull` 时重新投递并签发新 token,旧 token 随之失效。
+- **空队列返回空批次**(`count=0`、`lease_token=null`),不创建租约;事件新增后可继续 `pull`。
+
+```bash
+# 确认本批次, 游标推进到批次末尾
+curl -X POST http://localhost:8000/consumers/c1/ack \
+  -H 'Content-Type: application/json' \
+  -d '{"lease_token":"001aedeed7806011b7376e2c8fc9f65e"}'
+# 200 {"status":"acked","consumer_id":"c1","cursor":2}
+```
+
+`ack` **仅接受当前租约 token**:过期(`lease_expired`)、伪造或上一批次的旧 token(`lease_token_mismatch`)、无活动租约(`no_active_lease`)一律返回 **409**,游标不动,禁止越序确认。
+
 
 ## 哈希链规范
 
@@ -97,6 +135,7 @@ curl http://localhost:8000/integrity
 
 - **幂等**:`event_id` 上有 `UNIQUE` 约束,重复插入触发 `IntegrityError` 后返回 200 `duplicate`,并发下也不会产生重复记录。
 - **接收顺序**:自增主键 `id` 即首次接收顺序,重放按它排序。
+- **消费游标**:`consumers` 表记录每个 `consumer_id` 的 `cursor`(已确认到的 seq)与当前租约(token、批次起止 seq、过期时间);`pull`/`ack` 均在 `BEGIN IMMEDIATE` 事务内完成"检查租约 -> 变更"两步,并发下拉取同一 consumer 也只会签发一个租约。租约过期判定在应用层用 `datetime` 比较,避免字符串比较陷阱。
 - **完整性哈希链**:每条记录引用上一条哈希,写入与链字段更新在同一事务完成(`BEGIN IMMEDIATE` 保证并发下链头一致);`GET /integrity` 全链校验。
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
@@ -109,6 +148,8 @@ curl http://localhost:8000/integrity
 | GET | `/events` | 时间范围分页查询(`from`/`to`/`page`/`page_size`) |
 | POST | `/replay` | 批量重放,按首次接收顺序输出 |
 | GET | `/integrity` | 校验完整性哈希链,返回 `verified`/`checked`/`first_break` |
+| POST | `/consumers/{id}/pull` | 原子租用游标后的连续事件批次(`limit`/`lease_seconds`),租约内重复拉取返回同一批次 |
+| POST | `/consumers/{id}/ack` | 凭当前租约 token 确认批次并推进游标;过期/伪造/旧 token 返回 409 |
 | GET | `/health` | 健康检查 |
 
 交互式文档:启动后访问 `http://localhost:8000/docs`。

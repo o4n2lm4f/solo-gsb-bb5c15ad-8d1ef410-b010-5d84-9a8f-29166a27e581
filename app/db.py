@@ -18,7 +18,25 @@ CREATE TABLE IF NOT EXISTS events (
     hash        TEXT                                -- 本记录哈希(固定 JSON 规范的 SHA-256)
 );
 CREATE INDEX IF NOT EXISTS idx_events_occurred_at ON events (occurred_at);
+CREATE TABLE IF NOT EXISTS consumers (
+    consumer_id      TEXT PRIMARY KEY,
+    cursor           INTEGER NOT NULL DEFAULT 0,  -- 已确认到的 seq, 下一条待消费为 cursor+1
+    lease_token      TEXT,                        -- 当前租约 token(无租约为 NULL)
+    lease_start_seq  INTEGER,                     -- 租约批次起始 seq
+    lease_end_seq    INTEGER,                     -- 租约批次末尾 seq(确认后游标推进到此)
+    lease_expires_at TEXT                         -- 租约过期时间(UTC ISO8601)
+);
 """
+
+
+def row_to_event(row: sqlite3.Row) -> dict:
+    return {
+        "seq": row["id"],  # 首次接收顺序号
+        "event_id": row["event_id"],
+        "occurred_at": row["occurred_at"],
+        "payload": json.loads(row["payload"]),
+        "received_at": row["received_at"],
+    }
 
 
 def init_db() -> None:

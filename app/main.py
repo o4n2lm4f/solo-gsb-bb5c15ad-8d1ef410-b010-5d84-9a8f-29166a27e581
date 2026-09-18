@@ -8,9 +8,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .chain import GENESIS_HASH, record_hash
-from .db import get_conn, init_db
+from .consumers import router as consumers_router
+from .db import get_conn, init_db, row_to_event
 
 app = FastAPI(title="Webhook Event Receiver & Replay")
+app.include_router(consumers_router)
 
 
 @app.on_event("startup")
@@ -41,16 +43,6 @@ def normalize_dt(dt: datetime) -> str:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def row_to_event(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "seq": row["id"],  # 首次接收顺序号
-        "event_id": row["event_id"],
-        "occurred_at": row["occurred_at"],
-        "payload": json.loads(row["payload"]),
-        "received_at": row["received_at"],
-    }
 
 
 # ---------- endpoints ----------
